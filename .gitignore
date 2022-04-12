@@ -40,3 +40,5 @@
 */CMakeCache.txt
 *.svg
 *.gpl
+*.vscode/
+*/main
