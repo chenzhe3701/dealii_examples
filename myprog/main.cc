@@ -1,73 +1,172 @@
 #include <iostream>
 #include <fstream>
-#include <cmath>
 
 #include <deal.II/grid/tria.h>
+#include <deal.II/dofs/dof_handler.h>
 #include <deal.II/grid/grid_generator.h>
 #include <deal.II/grid/grid_out.h>
 
-#include <deal.II/dofs/dof_handler.h>
 #include <deal.II/fe/fe_q.h>
+
 #include <deal.II/dofs/dof_tools.h>
+
+#include <deal.II/fe/fe_values.h>
+#include <deal.II/base/quadrature_lib.h>
+#include <deal.II/fe/mapping_q1.h>
+
+#include <deal.II/base/function.h>
+#include <deal.II/numerics/vector_tools.h>
+#include <deal.II/numerics/matrix_tools.h>
+
+#include <deal.II/lac/vector.h>
+#include <deal.II/lac/full_matrix.h>
 #include <deal.II/lac/sparse_matrix.h>
 #include <deal.II/lac/dynamic_sparsity_pattern.h>
-#include <deal.II/dofs/dof_renumbering.h>
-#include <deal.II/fe/mapping_q1.h>
+#include <deal.II/lac/solver_cg.h>
+#include <deal.II/lac/precondition.h>
+
+#include <deal.II/numerics/data_out.h>
+#include <fstream>
+#include <iostream>
 
 using namespace dealii;
 
-template <int dim>
-void gnuplot_mesh(Triangulation<dim> &triangulation, DoFHandler<dim> &dof_handler){
-  std::ofstream out("gnuplot.gpl");
+class Problem {
+public:
+    Problem();
+    void run();
 
-  out << "plot '-' using 1:2 with linespoints linewidth 2 pointsize 2 pointtype 7,"
-    << " '-' with labels point pt 2 offset 0,0 textcolor 'red' font ',24'"
-    << std::endl;
-  GridOut grid_out;
-  grid_out.write_gnuplot(triangulation, out);
+private:
+    void make_grid();
+    void setup_system();
+    void assemble_system();
+    void solve();
+    void output_results() const;
 
-  std::map<types::global_dof_index, Point<dim>> support_points;
-  DoFTools::map_dofs_to_support_points(MappingQ1<dim>(), dof_handler, support_points);
+    static const unsigned int dim = 1;
 
-  out << "e" << std::endl;  // additional entry
-  if (dim==2) {
-    DoFTools::write_gnuplot_dof_support_point_info(out, support_points);
-  } 
-  else if (dim==1) {
-    for (const auto &[index, point] : support_points) {
-      out << point << " " << 1 << " " << '"' << index << '"' << std::endl;
-    }
-  }
-  out << "e" << std::endl;  // additional entry
+    Triangulation<dim> triangulation;
+    FE_Q<dim> fe;
+    DoFHandler<dim> dof_handler;
 
-  std::cout << "Grid written to grid plot" << std::endl;
+    SparsityPattern sparsity_pattern;
+    SparseMatrix<double> system_matrix;
+
+    Vector<double> solution;
+    Vector<double> system_rhs;
+};
+
+
+Problem::Problem() : fe(1), dof_handler(triangulation) { }
+
+
+void Problem::make_grid() {
+    GridGenerator::hyper_cube(triangulation);
+    triangulation.refine_global(1);
+    std::cout << "Number of active cells: " << triangulation.n_active_cells() << std::endl;
 }
 
-int main()
-{
-  const int dim {2};
 
-  Triangulation<dim> triangulation;
-  GridGenerator::hyper_cube(triangulation, 10.0, 20.0);
-  triangulation.refine_global(1);
+void Problem::setup_system() {
+    dof_handler.distribute_dofs(fe);
+    std::cout << "Number of degrees of freedom: " << dof_handler.n_dofs() << std::endl;
 
-  DoFHandler<dim> dof_handler(triangulation);
-  
-  const FE_Q<dim> finite_element(1);
-  dof_handler.distribute_dofs(finite_element);
-  
-  DoFRenumbering::Cuthill_McKee(dof_handler); // Renumber and plot sparsity pattern
+    DynamicSparsityPattern dsp(dof_handler.n_dofs());
+    DoFTools::make_sparsity_pattern(dof_handler, dsp);
+    sparsity_pattern.copy_from(dsp);
 
-  // plot sparsity pattern
-  DynamicSparsityPattern dsp(dof_handler.n_dofs(), dof_handler.n_dofs());
-  SparsityPattern sparsity_pattern;  
-  DoFTools::make_sparsity_pattern(dof_handler, dsp);
-  sparsity_pattern.copy_from(dsp);
-  std::ofstream out_sp("sparsity_pattern_1.svg");
-  sparsity_pattern.print_svg(out_sp);  
-  
+    system_matrix.reinit(sparsity_pattern);
+    solution.reinit(dof_handler.n_dofs());
+    system_rhs.reinit(dof_handler.n_dofs());
+}
 
-  // plot triangulation mesh
-  gnuplot_mesh(triangulation, dof_handler);
+void Problem::assemble_system() {
+    std::cout << "Finite element degree: " << fe.degree << std::endl;
+    const unsigned int n_quadrature_points = fe.degree + 1;
+    QGauss<dim> quadrature_formula(n_quadrature_points);
+    FEValues<dim> fe_values(fe, quadrature_formula, 
+        update_values | update_gradients | update_JxW_values);
+    
+    const unsigned int dofs_per_cell = fe.n_dofs_per_cell();
 
+    FullMatrix<double> cell_matrix(dofs_per_cell,dofs_per_cell);
+    Vector<double> cell_rhs(dofs_per_cell);
+    std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
+
+    for (const auto &cell : dof_handler.active_cell_iterators()) {
+        fe_values.reinit(cell);
+        cell_matrix = 0;
+        cell_rhs = 0;
+
+        for (const auto q_index : fe_values.quadrature_point_indices()) {
+            for (const unsigned int i : fe_values.dof_indices()) {
+                for (const unsigned int j : fe_values.dof_indices()) {
+                    cell_matrix(i,j) += 
+                        fe_values.shape_grad(i, q_index) * // grad phi_i(x_q)
+                        fe_values.shape_grad(j, q_index) * // grad phi_j(x_q)
+                        fe_values.JxW(q_index); // dx
+                }
+            }
+
+            for (const unsigned int i : fe_values.dof_indices()) {
+                cell_rhs(i) += fe_values.shape_value(i, q_index) * // phi_i(x_q)
+                    1. * // f(x_q)
+                    fe_values.JxW(q_index); // dx
+            }
+        }
+
+        cell->get_dof_indices(local_dof_indices);
+
+        for (const unsigned int i : fe_values.dof_indices()) {
+            for (const unsigned int j : fe_values.dof_indices()) {
+                system_matrix.add(local_dof_indices[i], local_dof_indices[j], cell_matrix(i,j));
+            }
+        }
+        
+        for (const unsigned int i : fe_values.dof_indices()) {
+            system_rhs(local_dof_indices[i]) += cell_rhs(i);
+        }
+    }
+
+    // boundary
+    std::map<types::global_dof_index, double> boundary_values;
+    VectorTools::interpolate_boundary_values(dof_handler, 0, Functions::ZeroFunction<dim>(),boundary_values);
+    MatrixTools::apply_boundary_values(boundary_values, system_matrix, solution, system_rhs);
+}
+
+
+void Problem::solve() {
+    SolverControl solver_control(1000, 1e-12);
+    SolverCG<Vector<double>> solver(solver_control);
+    solver.solve(system_matrix, solution, system_rhs, PreconditionIdentity());
+}
+
+
+void Problem::output_results() const {
+    DataOut<dim> data_out;
+    data_out.attach_dof_handler(dof_handler);
+    data_out.add_data_vector(solution, "solution");
+    data_out.build_patches();
+
+    std::ofstream output("solution.vtk");
+    data_out.write_vtk(output);
+}
+
+
+void Problem::run() {
+  make_grid();
+  setup_system();
+  assemble_system();
+  solve();
+  output_results();
+}
+
+
+int main(){
+    deallog.depth_console(2);
+    
+    Problem myproblem;
+    myproblem.run();
+
+    return 0;
 }
